@@ -41,15 +41,6 @@ class GeoData:
         return self.geometry
 
     def buffer(self, distance, quad_segs=1, cap_style="square", join_style="bevel"):
-        # Warn if buffering in a geographic CRS (degrees instead of meters)
-        if self.crs in ["WGS84", "EPSG:4326", "EPSG:4269"] or (
-            isinstance(self.crs, str) and "longlat" in self.crs.lower()
-        ):
-            log.warning(
-                f"Buffering in geographic CRS '{self.crs}' - distance will be in degrees, not meters! "
-                "Consider converting to a projected CRS (e.g., UTM) before buffering."
-            )
-        
         self.geometry = self.geometry.buffer(distance, quad_segs, cap_style, join_style)
         return self
 
@@ -360,57 +351,8 @@ def generate_sweep_pattern(
 
 
 def decompose_polygon(
-    boundary: shapely.Polygon, obstacles: shapely.MultiPolygon | shapely.Polygon = None,
-    min_area_ratio: float = 0.01, safe_mode: bool = False
+    boundary: shapely.Polygon, obstacles: shapely.MultiPolygon | shapely.Polygon = None
 ):
-    """
-    Decompose a polygon into weakly monotone parts for coverage planning.
-    
-    Important: This function works best with polygons in geographic CRS (WGS84/EPSG:4326)
-    due to numerical precision issues in the underlying CGAL library with large coordinate
-    values (e.g., UTM coordinates). Keep polygons in their original geographic CRS during
-    decomposition, then convert results to projected CRS afterwards if needed.
-    
-    Args:
-        boundary: The polygon boundary to decompose (preferably in WGS84/EPSG:4326)
-        obstacles: Optional obstacles (holes) within the polygon
-        min_area_ratio: Minimum area ratio for decomposed parts (relative to total area).
-                       Parts smaller than this will be filtered out. Default is 0.01 (1%).
-        safe_mode: If True, skip decomposition for complex polygons that may cause crashes.
-                  Returns the original polygon instead. Default is False.
-    
-    Returns:
-        List of decomposed polygons, filtered to remove parts that are too small.
-        In safe_mode or if decomposition fails, returns [boundary] as fallback.
-    
-    Note:
-        The CGAL decomposition library may crash with certain polygon geometries when
-        using large coordinate values (>100,000). This is a known issue with specific
-        polygon shapes. Using geographic coordinates (degrees) avoids this problem.
-    """
-    # Validate that the boundary polygon is not empty or degenerate
-    if boundary.is_empty:
-        log.warning("Boundary polygon is empty, returning empty list")
-        return []
-    
-    if boundary.area < 1e-15:
-        log.warning(f"Boundary polygon has negligible area ({boundary.area}), returning empty list")
-        return []
-    
-    if not boundary.is_valid:
-        log.warning("Boundary polygon is invalid, attempting to fix")
-        boundary = boundary.buffer(0)  # Try to fix invalid geometry
-        if not boundary.is_valid or boundary.is_empty:
-            log.error("Could not fix invalid boundary polygon")
-            return []
-    
-    # Store original area for filtering small parts later
-    original_area = boundary.area
-    
-    # Use the boundary as-is (no normalization)
-    # The CGAL library works best with small coordinate values (like WGS84 degrees)
-    boundary_local = boundary
-    
     if obstacles is not None:
         if isinstance(obstacles, shapely.Polygon):
             obstacles = shapely.MultiPolygon([obstacles])
@@ -426,55 +368,16 @@ def decompose_polygon(
                     "Obstacles intersect with the boundary, the geometries will be merged."
                 )
                 boundary = obstacles.union(boundary)
-                boundary_local = boundary
             else:
                 updated_obstacles.append(obstacle)
 
-        obstacles = shapely.MultiPolygon(updated_obstacles) if updated_obstacles else None
-    
-    # Safe mode: skip decomposition for complex polygons
-    if safe_mode:
-        log.info("Safe mode enabled: skipping decomposition, using original polygon")
-        return [boundary]
-    
-    # Try decomposition with error handling
-    try:
-        pwh = bindings.Polygon_with_holes_2(shapely_polygon_to_cgal(boundary_local))
-        if obstacles is not None:
-            for poly in obstacles.geoms:
-                pwh.add_hole(shapely_polygon_to_cgal(poly))
-        decompose_polygons = bindings.decompose(pwh)
-        
-        # If decomposition returns empty list, fall back to original polygon
-        if not decompose_polygons:
-            log.warning("Decomposition returned no polygons, using original polygon")
-            return [boundary]
-            
-    except Exception as e:
-        log.warning(f"Decomposition failed with error: {e}. Using original polygon instead.")
-        return [boundary]
-    
-    # Convert decomposed polygons to shapely and filter small parts
-    min_area_threshold = original_area * min_area_ratio
-    result_polygons = []
-    filtered_count = 0
-    
-    for polygon in decompose_polygons:
-        shapely_poly = shapely.Polygon([(vertex.x, vertex.y) for vertex in polygon])
-        
-        # Filter out parts that are too small (likely to cause numerical issues)
-        if shapely_poly.area >= min_area_threshold:
-            result_polygons.append(shapely_poly)
-        else:
-            filtered_count += 1
-            log.debug(f"Filtering out small decomposed part: area={shapely_poly.area:.10f}, threshold={min_area_threshold:.10f}")
-    
-    if filtered_count > 0:
-        log.info(f"Filtered out {filtered_count} small decomposed parts (< {min_area_ratio*100:.1f}% of total area)")
-    
-    # If all parts were filtered out, return original polygon
-    if not result_polygons:
-        log.warning(f"All decomposed parts were too small, using original polygon")
-        return [boundary]
-    
-    return result_polygons
+        obstacles = shapely.MultiPolygon(updated_obstacles)
+    pwh = bindings.Polygon_with_holes_2(shapely_polygon_to_cgal(boundary))
+    if obstacles is not None:
+        for poly in obstacles.geoms:
+            pwh.add_hole(shapely_polygon_to_cgal(poly))
+    decompose_polygons = bindings.decompose(pwh)
+    return [
+        shapely.Polygon([(vertex.x, vertex.y) for vertex in polygon])
+        for polygon in decompose_polygons
+    ]
